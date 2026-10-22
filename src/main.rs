@@ -77,23 +77,42 @@ fn parse_args() -> Args {
 
 fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<()> {
     loop {
-        if let Some(cmd) = app.pending_run.take() {
+        if app.pending_run.is_some() {
             // Hand the terminal back in a sane state: cursor visible, cooked
             // mode, main screen. `restore()` alone leaves the cursor hidden.
             terminal.show_cursor()?;
             ratatui::restore();
             crossterm::execute!(std::io::stdout(), crossterm::cursor::Show)?;
-            // A successful login returns straight to the TUI; anything else
-            // waits so its output can be read.
-            let status = run_in_terminal(&cmd, !app.pending_login);
+            // Loops so a login accepted after a failed command runs before
+            // returning to the TUI.
+            while let Some(cmd) = app.pending_run.take() {
+                let status = run_in_terminal(&cmd);
+                // A successful login returns straight to the TUI; anything else
+                // waits so its output can be read. A command that failed on a
+                // profile with a login offers it, as an expired session fails
+                // every other call the same way.
+                let mut relogin = false;
+                if let Ok(s) = &status {
+                    let exit = format!("[exit {}]", s.code().unwrap_or(-1));
+                    if !s.success() && !app.pending_login && app.can_login() {
+                        relogin = offer_login(app, &exit);
+                    } else if !s.success() || !app.pending_login {
+                        println!();
+                        pause(&format!("{exit} Press Enter to return to ecsterm…"));
+                    }
+                }
+                app.status = match &status {
+                    Ok(s) if s.success() => "Command finished.".into(),
+                    Ok(s) => format!("Command exited with {}", s.code().map(|c| c.to_string()).unwrap_or_else(|| "signal".into())),
+                    Err(e) => format!("Failed to run command: {e}"),
+                };
+                app.command_finished(matches!(status, Ok(s) if s.success()));
+                if relogin {
+                    app.login();
+                }
+            }
             *terminal = ratatui::init();
             terminal.clear()?;
-            app.status = match &status {
-                Ok(s) if s.success() => "Command finished.".into(),
-                Ok(s) => format!("Command exited with {}", s.code().map(|c| c.to_string()).unwrap_or_else(|| "signal".into())),
-                Err(e) => format!("Failed to run command: {e}"),
-            };
-            app.command_finished(matches!(status, Ok(s) if s.success()));
             continue;
         }
         terminal.draw(|f| ui::draw(f, app))?;
@@ -119,17 +138,14 @@ fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> Result<()> {
     }
 }
 
-/// Runs `cmd` through the user's shell with the real terminal attached, then
-/// waits for Enter so non-interactive output stays readable. On success the
-/// pause is skipped unless `pause_on_success` is set.
+/// Runs `cmd` through the user's shell with the real terminal attached.
 ///
 /// The child gets freshly opened `/dev/tty` descriptors instead of inheriting
 /// our stdin/stdout. Interactive tools such as session-manager-plugin read the
 /// tty directly and fail with "read /dev/stdin: input/output error" when the
 /// inherited descriptor has been used by the TUI's event reader.
-fn run_in_terminal(cmd: &str, pause_on_success: bool) -> Result<std::process::ExitStatus> {
+fn run_in_terminal(cmd: &str) -> Result<std::process::ExitStatus> {
     use std::fs::OpenOptions;
-    use std::io::{BufRead, Write};
     use std::process::{Command, Stdio};
 
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
@@ -143,15 +159,41 @@ fn run_in_terminal(cmd: &str, pause_on_success: bool) -> Result<std::process::Ex
     ) {
         child.stdin(Stdio::from(i)).stdout(Stdio::from(o)).stderr(Stdio::from(e));
     }
-    let status = child.status()?;
-    if status.success() && !pause_on_success {
-        return Ok(status);
+    Ok(child.status()?)
+}
+
+/// After a command failed on a profile with a login: checks whether its
+/// session expired and if so asks to log in, otherwise pauses as usual.
+/// Returns whether the user wants to log in.
+fn offer_login(app: &App, exit: &str) -> bool {
+    use std::io::Write;
+
+    let profile = app.ecs.as_ref().map(|e| e.profile.as_str()).unwrap_or_default();
+    // The check takes a moment; say why nothing is happening.
+    print!("\n\x1b[2m{exit} Checking the session for {profile}…\x1b[0m");
+    let _ = std::io::stdout().flush();
+    if !app.session_expired() {
+        pause(&format!("{exit} Press Enter to return to ecsterm…"));
+        return false;
     }
-    print!("\n\x1b[2m[exit {}] Press Enter to return to ecsterm…\x1b[0m ", status.code().unwrap_or(-1));
-    std::io::stdout().flush()?;
+    let answer = pause(&format!("{exit} The session for {profile} has expired. Press Enter to log in, or n to return to ecsterm…"));
+    // Only a bare Enter or a yes logs in; anything else, EOF or a read error
+    // returns to the TUI.
+    matches!(answer.map(|a| a.trim().to_ascii_lowercase()).as_deref(), Some("" | "y" | "yes"))
+}
+
+/// Shows `prompt` on the current line, replacing what is there, and returns
+/// the line typed before Enter, or `None` on EOF or a read error.
+fn pause(prompt: &str) -> Option<String> {
+    use std::io::{BufRead, Write};
+
+    print!("\r\x1b[2K\x1b[2m{prompt}\x1b[0m ");
+    let _ = std::io::stdout().flush();
     let mut line = String::new();
-    std::io::stdin().lock().read_line(&mut line)?;
-    Ok(status)
+    match std::io::stdin().lock().read_line(&mut line) {
+        Ok(0) | Err(_) => None,
+        Ok(_) => Some(line),
+    }
 }
 
 fn handle_profiles(app: &mut App, code: KeyCode) {

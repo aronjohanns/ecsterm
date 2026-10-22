@@ -6,11 +6,12 @@ use anyhow::Result;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 
-/// Results coming back from background `aws` calls.
+/// Results coming back from background `aws` calls, tagged with the
+/// `logins` count from when the call started.
 pub enum Msg {
-    Children(Vec<usize>, Result<Vec<Node>>),
+    Children(Vec<usize>, u32, Result<Vec<Node>>),
     /// Credential check for the named profile.
-    Auth(String, Result<()>),
+    Auth(String, u32, Result<()>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -44,6 +45,9 @@ pub struct App {
 
     pub commands: Vec<CliCommand>,
     pub command_selected: usize,
+    /// Tree path the commands were built for; while it stays selected,
+    /// rebuilding keeps `command_selected`.
+    commands_path: Option<Vec<usize>>,
 
     pub region_input: Option<String>,
     /// Editable command text shown in a modal before running.
@@ -57,6 +61,9 @@ pub struct App {
     /// Printed to stdout after the terminal is restored.
     pub output_on_exit: Option<String>,
 
+    /// Successful logins so far. Background results from before the latest
+    /// one carry the old credentials' failures.
+    logins: u32,
     tx: Sender<Msg>,
     rx: Receiver<Msg>,
 }
@@ -84,6 +91,7 @@ impl App {
             focus: Focus::Tree,
             commands: vec![],
             command_selected: 0,
+            commands_path: None,
             region_input: None,
             command_input: None,
             pending_run: None,
@@ -91,6 +99,7 @@ impl App {
             status: String::new(),
             should_quit: false,
             output_on_exit: None,
+            logins: 0,
             tx,
             rx,
         };
@@ -205,16 +214,20 @@ impl App {
     fn check_credentials(&mut self) {
         let Some(ecs) = self.ecs.clone() else { return };
         self.status = format!("Checking credentials for {}…", ecs.profile);
-        let tx = self.tx.clone();
+        let (tx, logins) = (self.tx.clone(), self.logins);
         thread::spawn(move || {
             let res = ecs.check_credentials();
-            let _ = tx.send(Msg::Auth(ecs.profile, res));
+            let _ = tx.send(Msg::Auth(ecs.profile, logins, res));
         });
     }
 
     fn current_login(&self) -> Option<aws::Login> {
         let ecs = self.ecs.as_ref()?;
         self.profiles.iter().find(|p| p.name == ecs.profile)?.login
+    }
+
+    pub fn can_login(&self) -> bool {
+        self.current_login().is_some()
     }
 
     /// Runs the profile's login command (`aws sso login` / `aws login`).
@@ -229,16 +242,39 @@ impl App {
         }
     }
 
+    /// Whether `aws` says the current profile's session has expired, as
+    /// opposed to working or being unreachable. Blocks on an `aws` call, so
+    /// only use it after a command failed.
+    pub fn session_expired(&self) -> bool {
+        let Some(ecs) = &self.ecs else { return false };
+        match ecs.check_credentials() {
+            Ok(()) => false,
+            Err(e) => aws::is_expired_session(&format!("{e:#}")),
+        }
+    }
+
     /// Called by the main loop after `pending_run` has finished.
     pub fn command_finished(&mut self, success: bool) {
         if std::mem::take(&mut self.pending_login) {
             if success {
+                self.logins += 1;
                 self.status = Self::HELP.into();
-                self.reload_root();
+                self.reload_failed();
             } else {
                 self.status = "Login failed. Press L to try again.".into();
             }
         }
+    }
+
+    /// After a login: retries every node that failed, including the clusters
+    /// when the credential check stopped them from loading. The rest of the
+    /// tree and the selection stay, so a login mid-session returns to where the
+    /// user was. Loads still running retry when they fail (see `poll`).
+    fn reload_failed(&mut self) {
+        for path in self.tree.failed() {
+            self.load_children(path);
+        }
+        self.refresh_rows();
     }
 
     fn reload_root(&mut self) {
@@ -261,7 +297,14 @@ impl App {
     }
 
     pub fn refresh_rows(&mut self) {
+        // Follow the selected node when rows above it appear or disappear,
+        // e.g. a failed node reloading, so Enter still runs what was selected.
+        // `rebuild_commands` keeps its highlighted command the same way.
+        let selected = self.rows.get(self.selected).filter(|r| r.message.is_none()).map(|r| r.path.clone());
         self.rows = self.tree.rows();
+        if let Some(i) = selected.and_then(|p| self.rows.iter().position(|r| r.message.is_none() && r.path == p)) {
+            self.selected = i;
+        }
         if self.selected >= self.rows.len() {
             self.selected = self.rows.len().saturating_sub(1);
         }
@@ -287,10 +330,10 @@ impl App {
         node.loading = true;
         node.error = None;
         let kind = node.kind.clone();
-        let tx = self.tx.clone();
+        let (tx, logins) = (self.tx.clone(), self.logins);
         thread::spawn(move || {
             let res = load(&ecs, &kind);
-            let _ = tx.send(Msg::Children(path, res));
+            let _ = tx.send(Msg::Children(path, logins, res));
         });
     }
 
@@ -300,19 +343,33 @@ impl App {
         while let Ok(msg) = self.rx.try_recv() {
             changed = true;
             match msg {
-                Msg::Children(path, res) => {
-                    if let Some(node) = self.tree.get_mut(&path) {
-                        node.loading = false;
-                        match res {
-                            Ok(children) => node.children = Some(children),
-                            Err(e) => node.error = Some(format!("{e:#}")),
+                Msg::Children(path, logins, res) => {
+                    let Some(node) = self.tree.get_mut(&path) else { continue };
+                    node.loading = false;
+                    match res {
+                        Ok(children) => node.children = Some(children),
+                        // Started before a login; the new credentials may work.
+                        Err(_) if logins != self.logins => self.load_children(path),
+                        Err(e) => {
+                            let e = format!("{e:#}");
+                            let expired = aws::is_expired_session(&e);
+                            node.error = Some(e);
+                            if expired && self.can_login() {
+                                let profile = self.ecs.as_ref().map(|e| e.profile.as_str()).unwrap_or_default();
+                                self.status = format!("The session for {profile} has expired. Press L to log in.");
+                            }
                         }
                     }
                     self.refresh_rows();
                 }
-                Msg::Auth(profile, res) => {
+                Msg::Auth(profile, logins, res) => {
                     // Ignore results for a profile the user has since left.
                     if self.ecs.as_ref().map(|e| e.profile != profile).unwrap_or(true) {
+                        continue;
+                    }
+                    // A login finished while this ran; check the new credentials.
+                    if logins != self.logins {
+                        self.check_credentials();
                         continue;
                     }
                     match res {
@@ -320,7 +377,14 @@ impl App {
                             self.status = Self::HELP.into();
                             self.reload_root();
                         }
-                        Err(_) if self.current_login().is_some() => self.login(),
+                        Err(e) if self.can_login() => {
+                            // Shown if the login fails; `reload_failed` retries it.
+                            if let Some(n) = self.tree.get_mut(&[0]) {
+                                n.error = Some(format!("{e:#}"));
+                            }
+                            self.refresh_rows();
+                            self.login();
+                        }
                         Err(e) => {
                             self.status = format!("Credentials for {profile} failed: {e:#}");
                             self.reload_root();
@@ -435,6 +499,9 @@ impl App {
     // ----- commands -------------------------------------------------------------
 
     pub fn rebuild_commands(&mut self) {
+        let path = self.selected_node().map(|(row, _)| row.path.clone());
+        let keep = if path.is_some() && path == self.commands_path { self.command_selected } else { 0 };
+        self.commands_path = path;
         self.commands.clear();
         self.command_selected = 0;
         let Some(ecs) = self.ecs.clone() else { return };
@@ -494,6 +561,7 @@ impl App {
             })
             .map(|a| CliCommand { title: a.title.clone(), command: config::render(&a.command, &vars) })
             .collect();
+        self.command_selected = keep.min(self.commands.len().saturating_sub(1));
     }
 
     pub fn selected_command(&self) -> Option<&CliCommand> {
@@ -564,4 +632,56 @@ fn copy_to_clipboard(text: &str) -> Result<()> {
         }
     }
     Err(anyhow::anyhow!("no clipboard tool found: {:?}", last))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tree::tests::cluster;
+
+    /// ECS > [failed cluster (load error), open cluster > target cluster].
+    fn app_with_tree() -> App {
+        let mut app = App::new(Config::defaults(), None, None);
+        app.ecs = Some(Ecs { profile: "test".into(), region: "eu-west-1".into() });
+        let mut failed = cluster("failed");
+        failed.expanded = true;
+        failed.error = Some("Token has expired".into());
+        let mut open = cluster("open");
+        open.expanded = true;
+        open.children = Some(vec![cluster("target")]);
+        app.tree.get_mut(&[0]).unwrap().children = Some(vec![failed, open]);
+        app.refresh_rows();
+        app.selected = app.rows.iter().position(|r| r.path == [0, 1, 0]).unwrap();
+        app.rebuild_commands();
+        app
+    }
+
+    fn reload_failed_node(app: &mut App) {
+        let n = app.tree.get_mut(&[0, 0]).unwrap();
+        n.error = None;
+        n.children = Some(vec![cluster("a"), cluster("b")]);
+        app.refresh_rows();
+    }
+
+    #[test]
+    fn selection_follows_its_node_when_rows_above_change() {
+        let mut app = app_with_tree();
+        reload_failed_node(&mut app);
+        assert_eq!(app.rows[app.selected].path, [0, 1, 0]);
+        assert_eq!(app.selected_node().unwrap().1.label(), "target");
+    }
+
+    #[test]
+    fn highlighted_command_survives_a_refresh_but_not_moving() {
+        let mut app = app_with_tree();
+        assert!(app.commands.len() > 1, "cluster level needs two commands for this test");
+        app.focus = Focus::Commands;
+        app.command_selected = 1;
+        reload_failed_node(&mut app);
+        assert_eq!(app.command_selected, 1);
+
+        app.focus = Focus::Tree;
+        app.move_selection(-1);
+        assert_eq!(app.command_selected, 0);
+    }
 }

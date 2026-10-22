@@ -157,6 +157,23 @@ impl Tree {
         Some(n)
     }
 
+    /// Paths of the nodes whose last load failed.
+    pub fn failed(&self) -> Vec<Vec<usize>> {
+        fn walk(node: &Node, path: &mut Vec<usize>, out: &mut Vec<Vec<usize>>) {
+            if node.error.is_some() {
+                out.push(path.clone());
+            }
+            for (i, c) in node.children.iter().flatten().enumerate() {
+                path.push(i);
+                walk(c, path, out);
+                path.pop();
+            }
+        }
+        let mut out = Vec::new();
+        walk(&self.root, &mut Vec::new(), &mut out);
+        out
+    }
+
     pub fn rows(&self) -> Vec<Row> {
         let mut out = Vec::new();
         self.walk(&self.root, &mut Vec::new(), 0, &mut out);
@@ -189,5 +206,26 @@ impl Tree {
             }
             None => {}
         }
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+
+    pub(crate) fn cluster(name: &str) -> Node {
+        Node::new(Kind::Cluster(Cluster { arn: format!("arn:aws:ecs:eu-west-1:1:cluster/{name}"), name: name.into() }))
+    }
+
+    #[test]
+    fn failed_lists_nodes_with_errors_at_any_depth() {
+        let mut tree = Tree::new("eu-west-1".into());
+        let mut bad = cluster("bad");
+        bad.error = Some("Token has expired".into());
+        tree.get_mut(&[0]).unwrap().children = Some(vec![cluster("ok"), bad]);
+        assert_eq!(tree.failed(), vec![vec![0, 1]]);
+
+        tree.get_mut(&[0]).unwrap().error = Some("Token has expired".into());
+        assert_eq!(tree.failed(), vec![vec![0], vec![0, 1]]);
     }
 }

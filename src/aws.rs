@@ -32,6 +32,15 @@ impl Login {
     }
 }
 
+/// Whether an `aws` error means the session expired or its credentials were
+/// rejected, so logging in again can help. The CLI's credential errors all
+/// mention one of these; network failures (offline, an unknown region) name
+/// the "endpoint URL" instead, even when that URL is the SSO token endpoint.
+pub fn is_expired_session(err: &str) -> bool {
+    let err = err.to_ascii_lowercase();
+    !err.contains("endpoint url") && ["expired", "token", "aws login"].iter().any(|m| err.contains(m))
+}
+
 fn aws_dir() -> Option<PathBuf> {
     std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".aws"))
 }
@@ -315,6 +324,31 @@ mod tests {
         assert_eq!(profiles[1].login, None);
         assert_eq!(profiles[2].login, None);
         assert_eq!(profiles[3].login, Some(Login::Sso));
+    }
+
+    #[test]
+    fn expired_session_errors_are_told_apart_from_unreachable_endpoints() {
+        for expired in [
+            "Error when retrieving token from sso: Token has expired and refresh failed",
+            "Error loading SSO Token: Token for corp does not exist",
+            "The SSO session associated with this profile has expired or is otherwise invalid. To refresh this SSO session run aws sso login with the corresponding profile.",
+            "Your session has expired. Please reauthenticate using 'aws login'.",
+            "Unable to refresh login credentials because of a change in your password. Please reauthenticate with your new password using 'aws login'.",
+            "An error occurred (ExpiredToken) when calling the GetCallerIdentity operation: The security token included in the request is expired",
+            "An error occurred (UnauthorizedException) when calling the GetRoleCredentials operation: Session token not found or invalid",
+        ] {
+            assert!(is_expired_session(expired), "{expired}");
+        }
+        for other in [
+            "Could not connect to the endpoint URL: \"https://sts.eu-west-11.amazonaws.com/\"",
+            "Could not connect to the endpoint URL: \"https://oidc.eu-west-1.amazonaws.com/token\"",
+            "Connect timeout on endpoint URL: \"https://portal.sso.eu-west-1.amazonaws.com/federation/credentials\"",
+            "An error occurred (Throttling) when calling the GetCallerIdentity operation: Rate exceeded",
+            "The config profile (nope) could not be found",
+            "failed to launch `aws` CLI; is it installed and on PATH?",
+        ] {
+            assert!(!is_expired_session(other), "{other}");
+        }
     }
 
     #[test]
