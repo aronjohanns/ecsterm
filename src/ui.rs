@@ -4,7 +4,7 @@ use ratatui::{
     style::{Color, Modifier, Style},
 
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
+    widgets::{Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
     Frame,
 };
 
@@ -123,21 +123,16 @@ fn draw_tree(f: &mut Frame, app: &App, area: Rect) {
         .collect();
 
     let focused = app.focus == Focus::Tree;
-    let border = if focused { Style::default().fg(Color::Cyan) } else { Style::default() };
     let mut state = ListState::default().with_selected(Some(app.selected));
     let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).border_style(border).title(title))
+        .block(panel(title, focused))
         .highlight_style(Style::default().bg(if focused { Color::Blue } else { Color::DarkGray }).fg(Color::White));
     f.render_stateful_widget(list, area, &mut state);
 }
 
 fn draw_commands(f: &mut Frame, app: &App, area: Rect) {
     let focused = app.focus == Focus::Commands;
-    let border = if focused { Style::default().fg(Color::Cyan) } else { Style::default() };
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(border)
-        .title(" AWS CLI  (Enter run, e edit, y copy) ");
+    let block = panel(" AWS CLI  (Enter run, e edit, y copy) ".into(), focused);
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -183,11 +178,11 @@ fn draw_commands(f: &mut Frame, app: &App, area: Rect) {
     }
     for (i, c) in app.commands.iter().enumerate() {
         let sel = focused && i == app.command_selected;
-        let marker = if sel { "▶ " } else { "  " };
-        lines.push(Line::from(Span::styled(
-            format!("{marker}{}", c.title),
-            if sel { Style::default().fg(Color::Cyan).bold() } else { Style::default().bold() },
-        )));
+        let (marker, style) = if sel { ("▶ ", Style::default().fg(Color::Cyan).bold()) } else { ("  ", Style::default().bold()) };
+        lines.push(Line::from(vec![
+            Span::styled(marker, style),
+            Span::styled(c.title.clone(), if sel { style.underlined() } else { style }),
+        ]));
         lines.push(Line::from(Span::styled(
             format!("  {}", c.command),
             if sel { Style::default().fg(Color::Gray) } else { Style::default().fg(Color::DarkGray) },
@@ -195,6 +190,17 @@ fn draw_commands(f: &mut Frame, app: &App, area: Rect) {
         lines.push(Line::raw(""));
     }
     f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+}
+
+/// A panel's frame. The focused panel is thick and bright and the other one
+/// dimmed, so it is clear at a glance which panel the keys go to.
+fn panel(title: String, focused: bool) -> Block<'static> {
+    let (border_type, style) = if focused {
+        (BorderType::Thick, Style::default().fg(Color::Cyan).bold())
+    } else {
+        (BorderType::Plain, Style::default().fg(Color::DarkGray))
+    };
+    Block::default().borders(Borders::ALL).border_type(border_type).border_style(style).title(title)
 }
 
 fn centered(pct_x: u16, pct_y: u16, r: Rect) -> Rect {
@@ -206,4 +212,34 @@ fn centered(pct_x: u16, pct_y: u16, r: Rect) -> Rect {
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage((100 - pct_x) / 2), Constraint::Percentage(pct_x), Constraint::Percentage((100 - pct_x) / 2)])
         .split(v[1])[1]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+    use ratatui::{backend::TestBackend, buffer::Buffer, Terminal};
+
+    fn render(focus: Focus) -> Buffer {
+        let mut app = App::new(Config::defaults(), None, None);
+        app.screen = Screen::Explorer;
+        app.focus = focus;
+        let mut terminal = Terminal::new(TestBackend::new(40, 10)).unwrap();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    #[test]
+    fn only_the_focused_panel_has_a_thick_bright_border() {
+        // The tree panel takes 45% of the 40 columns, so the command panel starts at 18.
+        let (tree, commands) = ((0, 0), (18, 0));
+
+        let buf = render(Focus::Tree);
+        assert_eq!((buf[tree].symbol(), buf[tree].fg), ("┏", Color::Cyan));
+        assert_eq!((buf[commands].symbol(), buf[commands].fg), ("┌", Color::DarkGray));
+
+        let buf = render(Focus::Commands);
+        assert_eq!((buf[tree].symbol(), buf[tree].fg), ("┌", Color::DarkGray));
+        assert_eq!((buf[commands].symbol(), buf[commands].fg), ("┏", Color::Cyan));
+    }
 }
